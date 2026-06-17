@@ -7,9 +7,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制代码
-COPY app.py .
+COPY app(2).py .
 
 # 暴露端口（Railway/Render 会自动读取 PORT 环境变量）
 EXPOSE 8088
 
-CMD ["python", "app.py"]
+CMD ["python", "app(2).py"]
