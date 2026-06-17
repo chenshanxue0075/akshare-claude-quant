@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: quant-dashboard
+    runtime: docker
+    plan: free
+    envVars:
+      - key: USE_REAL
+        value: "true"
+      - key: ANTHROPIC_API_KEY
+        sync: false   # 在 Render 控制台手动填写，不写进代码
+    healthCheckPath: /
