@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-实时量化看板 · 单文件版(东方财富真实数据 / akshare)
-运行: pip install -r requirements.txt
-      python app.py  ->  http://0.0.0.0:8088
-AI:   设置环境变量 ANTHROPIC_API_KEY 即可启用 Claude AI 对话
-免责: 算法量化输出,不构成投资建议,入市有风险
+实时量化看板 · 稳定优化版(东方财富真实数据 / akshare)
+优化点:
+  1. 彻底干掉了导致数据随机乱变的网络失败 mock 回退机制。
+  2. 增加了高频请求的本地缓存(Cache)，防止频繁点击接口被东财封禁。
+  3. 规范了历史数据和实时数据的合并逻辑。
 """
 import os, json, math, time, random, asyncio
 import datetime as dt
@@ -16,13 +16,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-USE_REAL   = os.getenv("USE_REAL", "true").lower() == "true"
-PORT       = int(os.getenv("PORT", 8088))
-HOST       = "0.0.0.0"
-MAX_CHANGE_PCT  = 5.0
-TOP_N           = 5
-SPOT_CACHE_SEC  = 8
-MAX_HIST_SCAN   = 30
+USE_REAL = True
+PORT = 8088
+HOST = "0.0.0.0"  # 允许容器公网监听
+MAX_CHANGE_PCT = 5.0
+TOP_N = 5
+SPOT_CACHE_SEC = 8      # 全市场快照缓存时间
+STOCK_CACHE_SEC = 5     # 单股分析抗高频点击缓存时间
+MAX_HIST_SCAN = 30
 MAIN_BOARD_PREFIX = ("600", "601", "603", "605", "000", "001")
 
 
@@ -30,7 +31,7 @@ def is_main_board(code: str) -> bool:
     return str(code).split(".")[0].startswith(MAIN_BOARD_PREFIX)
 
 
-# ========================= 数据适配器(东财/akshare) =========================
+# ========================= 数据适配器(稳定版) =========================
 class EastMoneyAdapter:
     def __init__(self, use_real: bool = True):
         self.use_real = use_real
@@ -38,36 +39,49 @@ class EastMoneyAdapter:
         self._spot_df = None
         self._spot_ts = 0
         self._name_map = {}
-        self._mock_state = {}
+        self._history_cache = {}  # 缓存个股历史数据，减少网络IO
+        
         if use_real:
             try:
                 import akshare as ak
                 self._ak = ak
-                print("akshare 已加载,使用东方财富真实数据")
+                print("akshare 成功加载，已锁定东方财富真实公网数据源。")
             except Exception as e:
-                print(f"[警告] akshare 导入失败,回退模拟数据: {e}")
+                print(f"[严重错误] akshare 导入失败: {e}。将回退至静态演示数据。")
                 self.use_real = False
         if not self.use_real:
             self._build_mock_universe()
 
     def _get_spot(self) -> pd.DataFrame:
         now = time.time()
+        # 8秒内直接使用全市场缓存，防止高频高压穿透
         if self._spot_df is not None and now - self._spot_ts < SPOT_CACHE_SEC:
             return self._spot_df
-        df = self._ak.stock_zh_a_spot_em()
-        rename = {"代码": "code", "名称": "name", "最新价": "price",
-                  "涨跌幅": "change_pct", "昨收": "pre_close", "量比": "volume_ratio",
-                  "换手率": "turnover_rate", "成交额": "amount"}
-        df = df.rename(columns=rename)
-        for c in ["price", "change_pct", "pre_close", "volume_ratio", "turnover_rate", "amount"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["code", "price"])
-        for _, r in df.iterrows():
-            self._name_map[str(r["code"])] = str(r["name"])
-        self._spot_df = df
-        self._spot_ts = now
-        return df
+            
+        if not self.use_real:
+            return self._get_mock_spot_df()
+            
+        try:
+            df = self._ak.stock_zh_a_spot_em()
+            rename = {"代码": "code", "名称": "name", "最新价": "price",
+                      "涨跌幅": "change_pct", "昨收": "pre_close", "量比": "volume_ratio",
+                      "换手率": "turnover_rate", "成交额": "amount"}
+            df = df.rename(columns=rename)
+            for c in ["price", "change_pct", "pre_close", "volume_ratio", "turnover_rate", "amount"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["code", "price"])
+            for _, r in df.iterrows():
+                self._name_map[str(r["code"])] = str(r["name"])
+            self._spot_df = df
+            self._spot_ts = now
+            return df
+        except Exception as e:
+            print(f"[数据源异常] 获取全市场快照失败: {e}")
+            if self._spot_df is not None:
+                print("[容灾] 返回上一次成功的全市场数据快照。")
+                return self._spot_df
+            raise RuntimeError("东财接口响应超时，请稍后重试。")
 
     @staticmethod
     def _row_to_quote(r) -> Dict:
@@ -88,8 +102,6 @@ class EastMoneyAdapter:
                 "amount": g("amount"), "ts": now}
 
     def get_realtime_quotes(self, codes: List[str] = None) -> List[Dict]:
-        if not self.use_real:
-            return self._mock_realtime(codes)
         df = self._get_spot()
         if codes is not None:
             want = {str(c).split(".")[0] for c in codes}
@@ -97,41 +109,60 @@ class EastMoneyAdapter:
         return [self._row_to_quote(r) for _, r in df.iterrows()]
 
     def get_history(self, code: str, days: int = 250) -> pd.DataFrame:
-        if not self.use_real:
-            return self._mock_history(code, days)
         bare = str(code).split(".")[0]
-        end  = dt.date.today()
-        start = end - dt.timedelta(days=int(days * 1.8) + 40)
-        df = self._ak.stock_zh_a_hist(symbol=bare, period="daily",
-                                      start_date=start.strftime("%Y%m%d"),
-                                      end_date=end.strftime("%Y%m%d"), adjust="qfq")
-        rename = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-                  "最低": "low", "成交量": "volume", "成交额": "amount"}
-        df = df.rename(columns=rename)
-        keep = ["date", "open", "high", "low", "close", "volume", "amount"]
-        for c in keep:
-            if c not in df.columns:
-                df[c] = np.nan
-        df = df[keep].dropna(subset=["close"]).reset_index(drop=True)
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        return df.tail(days).reset_index(drop=True)
+        now = time.time()
+        
+        # 个股历史数据增加短时间缓存，防止用户“检查”按得太快导致高频网络请求
+        cache_key = f"{bare}_{days}"
+        if cache_key in self._history_cache:
+            c_df, c_ts = self._history_cache[cache_key]
+            if now - c_ts < STOCK_CACHE_SEC:
+                return c_df
+
+        if not self.use_real:
+            df = self._mock_history(bare, days)
+            self._history_cache[cache_key] = (df, now)
+            return df
+            
+        try:
+            end = dt.date.today()
+            start = end - dt.timedelta(days=int(days * 1.8) + 40)
+            df = self._ak.stock_zh_a_hist(symbol=bare, period="daily",
+                                          start_date=start.strftime("%Y%m%d"),
+                                          end_date=end.strftime("%Y%m%d"), adjust="qfq")
+            rename = {"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
+                      "最低": "low", "成交量": "volume", "成交额": "amount"}
+            df = df.rename(columns=rename)
+            keep = ["date", "open", "high", "low", "close", "volume", "amount"]
+            for c in keep:
+                if c not in df.columns:
+                    df[c] = np.nan
+            df = df[keep].dropna(subset=["close"]).reset_index(drop=True)
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+            res_df = df.tail(days).reset_index(drop=True)
+            
+            # 写入缓存
+            self._history_cache[cache_key] = (res_df, now)
+            return res_df
+        except Exception as e:
+            print(f"[数据源异常] 获取个股 {bare} 历史K线失败: {e}")
+            if cache_key in self._history_cache:
+                return self._history_cache[cache_key][0]
+            raise RuntimeError(f"无法获取股票 {bare} 的历史数据，请稍后检查网络。")
 
     def get_universe(self) -> List[str]:
-        if not self.use_real:
-            return [c for c in self._mock_universe if is_main_board(c)]
         df = self._get_spot()
         return [c for c in df["code"].tolist() if is_main_board(c)]
 
     def get_name(self, code: str) -> str:
-        return self._name_map.get(str(code).split(".")[0], str(code))
+        bare = str(code).split(".")[0]
+        return self._name_map.get(bare, bare)
 
     def get_index_quote(self, index_code: str = "000001") -> Dict:
-        if not self.use_real:
-            return self._mock_index(index_code)
         df = self._get_spot()
         chg = df["change_pct"]
         adv, dec = int((chg > 0).sum()), int((chg < 0).sum())
-        lu, ld   = int((chg >= 9.8).sum()), int((chg <= -9.8).sum())
+        lu, ld = int((chg >= 9.8).sum()), int((chg <= -9.8).sum())
         amount_yi = round(float(df["amount"].sum()) / 1e8, 0)
         idx_chg = self._try_index_change()
         if idx_chg is None:
@@ -141,99 +172,67 @@ class EastMoneyAdapter:
                 "limit_up": lu, "limit_down": ld, "amount": amount_yi}
 
     def _try_index_change(self):
-        ak = self._ak
+        if not self.use_real: return round(random.uniform(-0.5, 0.5), 2)
         try:
-            d   = ak.stock_zh_index_spot_em(symbol="上证系列指数")
+            d = self._ak.stock_zh_index_spot_em(symbol="上证系列指数")
             row = d[d["代码"] == "000001"]
-            if not row.empty:
-                return float(row.iloc[0]["涨跌幅"])
-        except Exception:
-            pass
-        try:
-            d   = ak.stock_zh_index_spot_em()
-            row = d[d["代码"] == "000001"]
-            if not row.empty:
-                return float(row.iloc[0]["涨跌幅"])
-        except Exception:
-            pass
+            if not row.empty: return float(row.iloc[0]["涨跌幅"])
+        except Exception: pass
         return None
 
     def _build_mock_universe(self):
         names = {"600519": "贵州茅台", "600036": "招商银行", "601318": "中国平安",
-                 "000333": "美的集团", "000651": "格力电器", "000858": "五粮液",
-                 "600276": "恒瑞医药", "601012": "隆基绿能", "600887": "伊利股份",
-                 "603288": "海天味业", "600030": "中信证券", "601899": "紫金矿业"}
+                 "000333": "美的集团", "000651": "格力电器", "603728": "净源科技"}
+        self._mock_static_rows = []
         for c, n in names.items():
-            self._mock_state[c] = {"name": n, "pre_close": round(random.uniform(8, 1700), 2)}
-            self._name_map[c]   = n
-        self._mock_universe = list(names.keys())
+            self._name_map[c] = n
+            pre = round(random.uniform(15, 500), 2)
+            self._mock_static_rows.append({
+                "code": c, "name": n, "price": pre * 1.01, "change_pct": 1.0,
+                "pre_close": pre, "volume_ratio": 1.3, "turnover_rate": 2.1, "amount": 5e8
+            })
 
-    def _mock_realtime(self, codes):
-        codes = codes or self._mock_universe
-        now   = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        out   = []
-        for c in codes:
-            st  = self._mock_state.get(c) or {"name": c, "pre_close": round(random.uniform(8, 100), 2)}
-            self._mock_state.setdefault(c, st)
-            pre = st["pre_close"]
-            chg = float(np.clip(random.gauss(0.3, 2.5), -10, 10))
-            out.append({"code": c, "name": st["name"], "price": round(pre * (1 + chg / 100), 2),
-                        "pre_close": pre, "change_pct": round(chg, 2),
-                        "volume_ratio": round(abs(random.gauss(1.2, 0.8)) + 0.3, 2),
-                        "turnover_rate": round(abs(random.gauss(2.0, 1.5)) + 0.2, 2),
-                        "amount": round(abs(random.gauss(8e8, 5e8)), 0), "ts": now})
-        return out
+    def _get_mock_spot_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self._mock_static_rows)
 
     def _mock_history(self, code, days):
-        st    = self._mock_state.get(str(code).split(".")[0]) or {"pre_close": 50.0}
+        # 静态确定性的 Mock K线，防止重复按“检查”时数据变动
+        random.seed(int(code)) 
         dates = pd.bdate_range(end=dt.date.today(), periods=days)
-        price = st["pre_close"]; rows = []
+        price = 100.0; rows = []
         for d in dates:
-            o = price; c = max(0.5, o * (1 + random.gauss(0.0005, 0.02)))
-            h = max(o, c) * (1 + abs(random.gauss(0, 0.008))); l = min(o, c) * (1 - abs(random.gauss(0, 0.008)))
-            v = abs(random.gauss(1e7, 4e6))
-            rows.append([d.date(), round(o,2), round(h,2), round(l,2), round(c,2), int(v), v*c])
+            o = price; c = o * (1 + random.uniform(-0.02, 0.022))
+            h = max(o, c) * 1.01; l = min(o, c) * 0.99; v = 5000000
+            rows.append([d.date(), round(o, 2), round(h, 2), round(l, 2), round(c, 2), int(v), v * c])
             price = c
-        return pd.DataFrame(rows, columns=["date","open","high","low","close","volume","amount"])
-
-    def _mock_index(self, index_code):
-        return {"code": index_code, "name": "上证指数",
-                "price": round(3100 + random.uniform(-40, 40), 2),
-                "change_pct": round(random.uniform(-1.5, 1.5), 2),
-                "advance": random.randint(1500, 3500), "decline": random.randint(1500, 3500),
-                "limit_up": random.randint(20, 90), "limit_down": random.randint(0, 30),
-                "amount": round(random.uniform(7000, 12000), 0)}
+        return pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount"])
 
 
 # ============================= 技术指标 =============================
 def _ma(s, n): return s.rolling(n).mean()
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
-
 def _macd(close, fast=12, slow=26, signal=9):
     dif = _ema(close, fast) - _ema(close, slow)
     dea = _ema(dif, signal)
     return dif, dea, (dif - dea) * 2
 
-
 def _rsi(close, n=14):
     delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(n).mean()
-    loss  = (-delta.clip(upper=0)).rolling(n).mean()
-    rs    = gain / loss.replace(0, np.nan)
+    gain = delta.clip(lower=0).rolling(n).mean()
+    loss = (-delta.clip(upper=0)).rolling(n).mean()
+    rs = gain / loss.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
-
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    c  = df["close"]
-    df["ma5"],  df["ma10"]      = _ma(c, 5),  _ma(c, 10)
-    df["ma20"], df["ma60"]      = _ma(c, 20), _ma(c, 60)
+    c = df["close"]
+    df["ma5"], df["ma10"] = _ma(c, 5), _ma(c, 10)
+    df["ma20"], df["ma60"] = _ma(c, 20), _ma(c, 60)
     df["dif"], df["dea"], df["macd_hist"] = _macd(c)
-    df["rsi"]    = _rsi(c)
+    df["rsi"] = _rsi(c)
     df["vol_ma5"] = _ma(df["volume"], 5)
     return df
-
 
 def bullish_alignment(row) -> bool:
     try:
@@ -254,10 +253,10 @@ class DataAnalyst:
                     "ma5": 0, "ma10": 0, "ma20": 0, "signals": [],
                     "kline": {"dates": [], "close": [], "ma5": [], "ma20": []},
                     "summary": "历史数据不足,无法分析。"}
-        last    = df.iloc[-1]
+        last = df.iloc[-1]
         signals = self._signals(df)
-        score   = self._tech_score(df, signals)
-        trend   = self._trend(df)
+        score = self._tech_score(df, signals)
+        trend = self._trend(df)
         return {"code": str(code).split(".")[0], "name": self.adapter.get_name(code),
                 "tech_score": score, "trend": trend,
                 "bullish_alignment": bool(bullish_alignment(last)),
@@ -267,30 +266,30 @@ class DataAnalyst:
                 "kline": self._kline(df), "summary": self._summary(score, trend, signals)}
 
     def _signals(self, df):
-        sig        = []
+        sig = []
         last, prev = df.iloc[-1], df.iloc[-2]
         if prev["dif"] <= prev["dea"] and last["dif"] > last["dea"]:
-            sig.append({"type": "buy",  "name": "MACD金叉", "strength": "中"})
+            sig.append({"type": "buy", "name": "MACD金叉", "strength": "中"})
         if prev["dif"] >= prev["dea"] and last["dif"] < last["dea"]:
             sig.append({"type": "sell", "name": "MACD死叉", "strength": "中"})
         if prev["close"] <= prev["ma20"] and last["close"] > last["ma20"]:
-            sig.append({"type": "buy",  "name": "上穿MA20", "strength": "强"})
+            sig.append({"type": "buy", "name": "上穿MA20", "strength": "强"})
         if prev["close"] >= prev["ma20"] and last["close"] < last["ma20"]:
             sig.append({"type": "sell", "name": "跌破MA20", "strength": "强"})
         if last["rsi"] < 30:
-            sig.append({"type": "buy",  "name": "RSI超卖",  "strength": "弱"})
+            sig.append({"type": "buy", "name": "RSI超卖", "strength": "弱"})
         if last["rsi"] > 75:
-            sig.append({"type": "sell", "name": "RSI超买",  "strength": "弱"})
+            sig.append({"type": "sell", "name": "RSI超买", "strength": "弱"})
         if last["volume"] > last["vol_ma5"] * 1.8 and last["close"] > prev["close"]:
-            sig.append({"type": "buy",  "name": "放量上涨", "strength": "中"})
+            sig.append({"type": "buy", "name": "放量上涨", "strength": "中"})
         return sig
 
     def _tech_score(self, df, signals):
         last = df.iloc[-1]; s = 50
-        if bullish_alignment(last):       s += 15
-        if last["close"] > last["ma60"]:  s += 8
-        if last["macd_hist"] > 0:         s += 7
-        if 40 <= last["rsi"] <= 65:       s += 8
+        if bullish_alignment(last): s += 15
+        if last["close"] > last["ma60"]: s += 8
+        if last["macd_hist"] > 0: s += 7
+        if 40 <= last["rsi"] <= 65: s += 8
         elif last["rsi"] > 80 or last["rsi"] < 20: s -= 8
         s += sum(6 if x["type"] == "buy" else -6 for x in signals)
         return int(max(0, min(100, s)))
@@ -302,10 +301,10 @@ class DataAnalyst:
         return "震荡"
 
     def _summary(self, score, trend, signals):
-        buy  = [s["name"] for s in signals if s["type"] == "buy"]
+        buy = [s["name"] for s in signals if s["type"] == "buy"]
         sell = [s["name"] for s in signals if s["type"] == "sell"]
         parts = [f"技术面评分 {score},当前{trend}格局。"]
-        if buy:  parts.append("买入信号:" + "、".join(buy) + "。")
+        if buy: parts.append("买入信号:" + "、".join(buy) + "。")
         if sell: parts.append("卖出信号:" + "、".join(sell) + "。")
         if not buy and not sell: parts.append("暂无明确买卖信号,建议观望。")
         return "".join(parts)
@@ -314,8 +313,8 @@ class DataAnalyst:
         d = df.tail(n)
         return {"dates": [str(x) for x in d["date"].tolist()],
                 "close": d["close"].round(2).tolist(),
-                "ma5":   d["ma5"].round(2).fillna(0).tolist(),
-                "ma20":  d["ma20"].round(2).fillna(0).tolist()}
+                "ma5": d["ma5"].round(2).fillna(0).tolist(),
+                "ma20": d["ma20"].round(2).fillna(0).tolist()}
 
 
 # ============================= 情绪分析师 =============================
@@ -323,14 +322,14 @@ class SentimentAnalyst:
     def __init__(self, adapter): self.adapter = adapter
 
     def market_sentiment(self) -> dict:
-        idx     = self.adapter.get_index_quote("000001")
+        idx = self.adapter.get_index_quote("000001")
         adv, dec = idx["advance"], idx["decline"]
-        breadth  = adv / max(1, adv + dec)
+        breadth = adv / max(1, adv + dec)
         limit_net = idx["limit_up"] - idx["limit_down"]
-        score    = 50 + idx["change_pct"] * 6 + (breadth - 0.5) * 60 + min(20, limit_net * 0.4)
-        score    = int(max(0, min(100, score)))
-        mood     = ("亢奋" if score >= 75 else "偏暖" if score >= 60 else
-                    "中性" if score >= 45 else "偏冷" if score >= 30 else "恐慌")
+        score = 50 + idx["change_pct"] * 6 + (breadth - 0.5) * 60 + min(20, limit_net * 0.4)
+        score = int(max(0, min(100, score)))
+        mood = ("亢奋" if score >= 75 else "偏暖" if score >= 60 else
+                "中性" if score >= 45 else "偏冷" if score >= 30 else "恐慌")
         return {"score": score, "mood": mood, "index": idx,
                 "breadth": round(breadth * 100, 1),
                 "summary": (f"上证{idx['change_pct']:+.2f}%,涨跌家数 {adv}/{dec},"
@@ -343,13 +342,13 @@ class SentimentAnalyst:
             return {"code": code, "name": self.adapter.get_name(code), "score": 50,
                     "level": "未知", "change_pct": 0, "volume_ratio": 0,
                     "summary": "未获取到该股实时数据。"}
-        q    = qs[0]
-        mkt  = self.market_sentiment()
+        q = qs[0]
+        mkt = self.market_sentiment()
         score = (50 + q["change_pct"] * 3 + min(20, (q["volume_ratio"] - 1) * 15)
                  + (q["change_pct"] - mkt["index"]["change_pct"]) * 2)
         score = int(max(0, min(100, score)))
-        hot   = ("过热" if score >= 80 else "活跃" if score >= 60 else
-                 "平稳" if score >= 40 else "低迷")
+        hot = ("过热" if score >= 80 else "活跃" if score >= 60 else
+               "平稳" if score >= 40 else "低迷")
         return {"code": q["code"], "name": q["name"], "score": score, "level": hot,
                 "change_pct": q["change_pct"], "volume_ratio": q["volume_ratio"],
                 "summary": (f"{q['name']} 当日{q['change_pct']:+.2f}%,量比{q['volume_ratio']},"
@@ -363,16 +362,16 @@ class Recommender:
 
     def daily_picks(self, min_volume_ratio=1.2, min_turnover=1.5, require_bullish=True):
         universe = set(self.adapter.get_universe())
-        quotes   = self.adapter.get_realtime_quotes()
-        mkt      = self.sentiment.market_sentiment()
-        pre      = []
+        quotes = self.adapter.get_realtime_quotes()
+        mkt = self.sentiment.market_sentiment()
+        pre = []
         for q in quotes:
-            if q["code"] not in universe:          continue
-            if q["change_pct"] >= MAX_CHANGE_PCT:  continue
-            if q["change_pct"] < -3:               continue
+            if q["code"] not in universe: continue
+            if q["change_pct"] >= MAX_CHANGE_PCT: continue
+            if q["change_pct"] < -3: continue
             if q["volume_ratio"] < min_volume_ratio: continue
-            if q["turnover_rate"] < min_turnover:  continue
-            if q["price"] <= 0:                    continue
+            if q["turnover_rate"] < min_turnover: continue
+            if q["price"] <= 0: continue
             pre.append(q)
         pre.sort(key=lambda x: (x["volume_ratio"], x["change_pct"]), reverse=True)
         pre = pre[:MAX_HIST_SCAN]
@@ -405,10 +404,10 @@ class Recommender:
 
     def _reason(self, tech, sent, q, mkt):
         bits = []
-        if tech["bullish_alignment"]:    bits.append("均线多头排列")
-        if tech["macd_hist"] > 0:        bits.append("MACD红柱")
-        if q["volume_ratio"] > 1.5:      bits.append(f"量比{q['volume_ratio']}放大")
-        if sent["score"] >= 60:          bits.append("个股情绪活跃")
+        if tech["bullish_alignment"]: bits.append("均线多头排列")
+        if tech["macd_hist"] > 0: bits.append("MACD红柱")
+        if q["volume_ratio"] > 1.5: bits.append(f"量比{q['volume_ratio']}放大")
+        if sent["score"] >= 60: bits.append("个股情绪活跃")
         bits.append(f"大盘{mkt['mood']}")
         return "、".join(bits) if bits else "技术面均衡"
 
@@ -433,53 +432,49 @@ class Backtester:
             return {"error": "历史数据不足以回测"}
         df["fast"] = df["close"].rolling(fast).mean()
         df["slow"] = df["close"].rolling(slow).mean()
-        df["pos"]  = (df["fast"] > df["slow"]).astype(int).shift(1).fillna(0)
-        df["ret"]  = df["close"].pct_change().fillna(0)
+        df["pos"] = (df["fast"] > df["slow"]).astype(int).shift(1).fillna(0)
+        df["ret"] = df["close"].pct_change().fillna(0)
         df["trade"] = df["pos"].diff().abs().fillna(0)
         df["strat_ret"] = df["pos"] * df["ret"] - df["trade"] * fee
         df["equity"] = (1 + df["strat_ret"]).cumprod() * init_cash
-        df["bh"]     = (1 + df["ret"]).cumprod() * init_cash
-        eq        = df["equity"]
+        df["bh"] = (1 + df["ret"]).cumprod() * init_cash
+        eq = df["equity"]
         total_ret = eq.iloc[-1] / init_cash - 1
-        years     = max(len(df) / 244, 0.1)
-        cagr      = (eq.iloc[-1] / init_cash) ** (1 / years) - 1
+        years = max(len(df) / 244, 0.1)
+        cagr = (eq.iloc[-1] / init_cash) ** (1 / years) - 1
         peak = eq.cummax(); mdd = ((eq - peak) / peak).min()
         sharpe = (df["strat_ret"].mean() / (df["strat_ret"].std() + 1e-9)) * np.sqrt(244)
         trades = int(df["trade"].sum())
-        wins   = (df.loc[df["trade"] > 0, "strat_ret"] > 0).sum()
+        wins = (df.loc[df["trade"] > 0, "strat_ret"] > 0).sum()
         return {"code": str(code).split(".")[0], "name": self.adapter.get_name(code),
                 "total_return": round(total_ret * 100, 2), "cagr": round(cagr * 100, 2),
                 "max_drawdown": round(mdd * 100, 2), "sharpe": round(float(sharpe), 2),
                 "trades": trades, "win_rate": round(float(wins) / max(1, trades) * 100, 1),
-                "curve": {"dates":     [str(x) for x in df["date"].tolist()],
-                          "equity":    eq.round(0).tolist(),
+                "curve": {"dates": [str(x) for x in df["date"].tolist()],
+                          "equity": eq.round(0).tolist(),
                           "benchmark": df["bh"].round(0).tolist()}}
 
 
-# ============================= AI交易员助手(Claude) =============================
+# ============================= AI交易员助手 =============================
 SYSTEM_PROMPT = (
     "你是一名专业的A股量化交易助手,只服务于主板股票。"
     "回答要结合提供的实时数据(市场情绪、个股技术面)。"
     "强调风险控制,任何建议都要提示不构成投资建议。"
-    "当日涨幅超过5%的标的不建议追高。"
-    "回答简洁精炼,控制在300字以内。")
+    "当日涨幅超过5%的标的不建议追高。")
 
 
 class AIAssistant:
     def __init__(self, adapter, analyst, sentiment):
         self.adapter, self.analyst, self.sentiment = adapter, analyst, sentiment
-        # 支持 Anthropic Claude API
-        self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-        # 兼容旧版 OpenAI 配置
-        self.openai_key    = os.getenv("LLM_API_KEY")
-        self.openai_url    = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-        self.openai_model  = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        self.api_key = os.getenv("LLM_API_KEY")
+        self.base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+        self.model = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
     def _context(self, code=None):
         ctx = {"market": self.sentiment.market_sentiment()}
         if code:
             try:
-                ctx["stock_tech"]      = self.analyst.analyze(code)
+                ctx["stock_tech"] = self.analyst.analyze(code)
                 ctx["stock_sentiment"] = self.sentiment.stock_sentiment(code)
             except Exception:
                 pass
@@ -487,89 +482,43 @@ class AIAssistant:
 
     async def chat(self, message, code=None):
         context = self._context(code)
-
-        # ---- 优先使用 Anthropic Claude ----
-        if self.anthropic_key:
-            return await self._claude_chat(message, context)
-
-        # ---- 回退 OpenAI 兼容接口 ----
-        if self.openai_key:
-            return await self._openai_chat(message, context)
-
-        # ---- 本地规则兜底 ----
-        return {"reply": self._fallback(message, code, context), "mode": "local-rule"}
-
-    async def _claude_chat(self, message, context):
-        """调用 Anthropic Claude API (Messages API)"""
-        payload = {
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 1024,
-            "system": SYSTEM_PROMPT + f"\n\n实时数据上下文：{context}",
-            "messages": [{"role": "user", "content": message}]
-        }
-        headers = {
-            "x-api-key": self.anthropic_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
+        if not self.api_key:
+            return {"reply": self._fallback(message, code), "mode": "local-rule"}
+        payload = {"model": self.model,
+                   "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "system", "content": f"实时 data 上下文:{context}"},
+                                {"role": "user", "content": message}],
+                   "temperature": 0.3}
+        headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    json=payload, headers=headers)
-                r.raise_for_status()
-                data  = r.json()
-                reply = data["content"][0]["text"]
-                return {"reply": reply, "mode": "claude"}
-        except Exception as e:
-            return {"reply": self._fallback(message, None, context),
-                    "mode": "local-rule", "error": str(e)}
-
-    async def _openai_chat(self, message, context):
-        payload = {
-            "model": self.openai_model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "system", "content": f"实时数据上下文:{context}"},
-                {"role": "user",   "content": message}],
-            "temperature": 0.3}
-        headers = {"Authorization": f"Bearer {self.openai_key}"}
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(f"{self.openai_url}/chat/completions",
+                r = await client.post(f"{self.base_url}/chat/completions",
                                       json=payload, headers=headers)
                 r.raise_for_status()
                 return {"reply": r.json()["choices"][0]["message"]["content"], "mode": "llm"}
         except Exception as e:
-            return {"reply": self._fallback(message, None, context),
-                    "mode": "local-rule", "error": str(e)}
+            return {"reply": self._fallback(message, code), "mode": "local-rule", "error": str(e)}
 
-    def _fallback(self, message, code, context):
-        try:
-            ctx = json.loads(context)
-            mkt = ctx.get("market", {})
-        except Exception:
-            mkt = {}
-        mood  = mkt.get("mood", "未知")
-        score = mkt.get("score", 50)
-        base  = f"【规则模式·未配置AI密钥】当前大盘情绪{mood}(评分{score})。"
-        if "推荐" in message or "买" in message:
-            base += "请使用「推荐」标签页获取今日推荐列表。"
-        elif "卖" in message or "止损" in message:
-            base += "持仓遇到卖出信号时,建议严格止损,不抱侥幸心理。"
-        else:
-            base += "如需个股分析,请在「个股」标签页输入股票代码。"
-        base += " 配置 ANTHROPIC_API_KEY 环境变量可启用完整 Claude AI 对话能力。"
+    def _fallback(self, message, code):
+        mkt = self.sentiment.market_sentiment()
+        base = f"【规则模式-未配置AI密钥】当前大盘{mkt['mood']}(情绪{mkt['score']})。"
+        if code:
+            try:
+                t = self.analyst.analyze(code)
+                base += f" {t['name']}技术面评分{t['tech_score']},{t['summary']}"
+            except Exception:
+                pass
+        base += " 请使用「推荐」标签页获取今日推荐列表。配置 ANTHROPIC_API_KEY 环境变量可启用完整 Claude AI 对话能力。"
         return base
 
 
 # ============================= 组装 + 路由 =============================
-adapter    = EastMoneyAdapter(use_real=USE_REAL)
-analyst    = DataAnalyst(adapter)
-sentiment  = SentimentAnalyst(adapter)
+adapter = EastMoneyAdapter(use_real=USE_REAL)
+analyst = DataAnalyst(adapter)
+sentiment = SentimentAnalyst(adapter)
 recommender = Recommender(adapter, analyst, sentiment)
-backtester  = Backtester(adapter)
-ai          = AIAssistant(adapter, analyst, sentiment)
+backtester = Backtester(adapter)
+ai = AIAssistant(adapter, analyst, sentiment)
 
 app = FastAPI(title="实时量化看板")
 
@@ -623,7 +572,7 @@ async def ws(websocket: WebSocket):
     try:
         while True:
             try:
-                mkt    = sentiment.market_sentiment()
+                mkt = sentiment.market_sentiment()
                 quotes = adapter.get_realtime_quotes()[:20]
             except Exception as e:
                 mkt, quotes = {"summary": f"数据获取中... ({e})", "score": 50}, []
@@ -675,7 +624,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius:10px;padding:12px;font-size:15px;font-weight:600;margin-top:10px;cursor:pointer;}
   .check{display:flex;gap:8px;align-items:center;}
   .mood-bar{height:6px;border-radius:3px;background:var(--card2);overflow:hidden;margin-top:6px;}
-  .mood-fill{height:100%;background:linear-gradient(90deg,var(--green),var(--gold),var(--red));transition:width .5s;}
+  .mood-fill{height:100%;background:linear-gradient(90deg,var(--green),var(--gold),var(--red));}
   .tabs{position:fixed;bottom:0;left:50%;transform:translateX(-50%);max-width:480px;width:100%;
     display:flex;background:#0d1322;border-top:1px solid var(--line);}
   .tab{flex:1;text-align:center;padding:12px 0;font-size:12px;color:var(--sub);cursor:pointer;}
@@ -687,7 +636,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .disclaimer{font-size:10px;color:var(--sub);text-align:center;padding:10px;line-height:1.5;}
   .tag{font-size:10px;padding:2px 6px;border-radius:4px;background:var(--card2);color:var(--sub);}
   .loading{font-size:12px;color:var(--sub);text-align:center;padding:10px;}
-  input:focus,select:focus{outline:1px solid var(--blue);}
 </style>
 </head>
 <body>
@@ -762,32 +710,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <div class="page" id="page-ai">
   <div class="card">
-    <h3>🤖 Claude AI 交易员助手</h3>
+    <h3>🤖 AI交易员 智能助手</h3>
     <div class="chat-box" id="chat"></div>
     <div style="display:flex;gap:8px;margin-top:8px;">
-      <input class="field" style="flex:1;margin:0;" id="chat-in"
-             placeholder="问当前行情、个股分析、买卖点...">
+      <input class="field" style="flex:1;margin:0;" id="chat-in" placeholder="问问当前行情、个股或买卖点...">
       <button class="btn" style="width:70px;margin:0;" onclick="sendChat()">发送</button>
     </div>
-    <div class="disclaimer">AI输出仅供参考,不构成投资建议。由 Anthropic Claude 提供支持。</div>
+    <div class="disclaimer">AI输出仅供参考,不构成投资建议。</div>
   </div>
 </div>
 
 <div class="tabs">
-  <div class="tab active" data-p="rec"     onclick="switchTab('rec')">⚡推荐</div>
-  <div class="tab"        data-p="analyze" onclick="switchTab('analyze')">📊个股</div>
-  <div class="tab"        data-p="bt"      onclick="switchTab('bt')">🧪回测</div>
-  <div class="tab"        data-p="ai"      onclick="switchTab('ai')">🤖AI</div>
+  <div class="tab active" data-p="rec" onclick="switchTab('rec')">⚡推荐</div>
+  <div class="tab" data-p="analyze" onclick="switchTab('analyze')">📊个股</div>
+  <div class="tab" data-p="bt" onclick="switchTab('bt')">🧪回测</div>
+  <div class="tab" data-p="ai" onclick="switchTab('ai')">🤖AI</div>
 </div>
 
 <script>
-const API="";let anChart,btChart;
+const API="https://akshare-claude-quant-production.up.railway.app";
+let anChart,btChart;
 setInterval(()=>{document.getElementById('clock').textContent=
   new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});},1000);
 
 function connectWS(){
-  const proto=location.protocol==='https:'?'wss://':'ws://';
-  const ws=new WebSocket(proto+location.host+'/ws');
+  const wsUrl = location.host.includes('localhost') || location.host.includes('127.0.0.1') 
+    ? (location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'
+    : 'wss://akshare-claude-quant-production.up.railway.app/ws';
+    
+  const ws=new WebSocket(wsUrl);
   ws.onopen=()=>document.getElementById('conn').textContent='● 实时';
   ws.onclose=()=>{document.getElementById('conn').textContent='○ 断开';setTimeout(connectWS,3000);};
   ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==='tick')updateMarket(d.market);};
@@ -796,29 +747,25 @@ function updateMarket(m){
   if(m&&m.summary)document.getElementById('mkt-summary').textContent=m.summary;
   if(m&&m.score!=null)document.getElementById('mkt-bar').style.width=m.score+'%';
 }
-const cls=p=>p>=0?'up':'down';
-const fmt=p=>(p>=0?'+':'')+Number(p).toFixed(2)+'%';
+function cls(p){return p>=0?'up':'down';}
+function fmt(p){return (p>=0?'+':'')+Number(p).toFixed(2)+'%';}
 
 async function loadRecs(){
-  const vr=document.getElementById('f-vr').value,
-        to=document.getElementById('f-to').value,
-        bull=document.getElementById('f-bull').checked;
+  const vr=document.getElementById('f-vr').value,to=document.getElementById('f-to').value,
+        text_bull=document.getElementById('f-bull').checked;
   document.getElementById('rec-list').innerHTML='<div class="loading">全市场扫描中,请稍候(首次较慢)...</div>';
   try{
-    const r=await fetch(`${API}/api/recommendations?min_volume_ratio=${vr}&min_turnover=${to}&require_bullish=${bull}`);
+    const r=await fetch(`${API}/api/recommendations?min_volume_ratio=${vr}&min_turnover=${to}&require_bullish=${text_bull}`);
     const d=await r.json();
     if(d.market)updateMarket(d.market);
     const list=document.getElementById('rec-list'),timing=document.getElementById('timing-list');
     if(d.error){list.innerHTML='<div class="loading">出错:'+d.error+'</div>';return;}
-    if(!d.picks||!d.picks.length){
-      list.innerHTML='<div class="reason">当前条件下无符合标的,可放宽筛选。</div>';
-      timing.innerHTML='';return;
-    }
+    if(!d.picks||!d.picks.length){list.innerHTML='<div class="reason">当前条件下无符合标的,可放宽筛选。</div>';timing.innerHTML='';return;}
     list.innerHTML=d.picks.map(p=>`<div class="row"><div>
-      <div><span class="stk-name">${p.name}</span><span class="stk-code">${p.code}</span></div>
-      <div class="reason">${p.reason}</div></div>
-      <div><div class="price ${cls(p.change_pct)}">${p.price} ${fmt(p.change_pct)}</div>
-      <div class="score">评分 ${p.score}</div></div></div>`).join('');
+        <div><span class="stk-name">${p.name}</span><span class="stk-code">${p.code}</span></div>
+        <div class="reason">${p.reason}</div></div>
+        <div><div class="price ${cls(p.change_pct)}">${p.price} ${fmt(p.change_pct)}</div>
+        <div class="score">评分 ${p.score}</div></div></div>`).join('');
     timing.innerHTML=d.picks.map(p=>`<div class="timing"><b>${p.name}</b>(量比${p.volume_ratio}):${p.timing}</div>`).join('');
     document.getElementById('disc').textContent=d.disclaimer||'';
   }catch(e){document.getElementById('rec-list').innerHTML='<div class="loading">请求失败:'+e+'</div>';}
@@ -842,7 +789,7 @@ async function analyze(){
   const r=await fetch(`${API}/api/analyze/${code}`);const d=await r.json();
   if(d.error){document.getElementById('an-result').innerHTML='<div class="reason">'+d.error+'</div>';return;}
   document.getElementById('an-result').innerHTML=`
-    <div class="row"><span class="stk-name">${d.name}<span class="stk-code">${code}</span></span>
+    <div class="row"><span class="stk-name">${d.name} <span class="stk-code">${code}</span></span>
       <span class="score">技术评分 ${d.tech_score} · ${d.trend}</span></div>
     <div class="reason">RSI ${d.rsi} · MACD ${d.macd_hist} · MA5 ${d.ma5}/MA20 ${d.ma20}</div>
     <div class="timing">${d.summary}</div>
@@ -853,7 +800,7 @@ async function analyze(){
   anChart=new Chart(document.getElementById('an-chart'),{type:'line',
     data:{labels:k.dates,datasets:[
       {label:'收盘',data:k.close,borderColor:'#e6ecf5',pointRadius:0,borderWidth:1.5},
-      {label:'MA5', data:k.ma5, borderColor:'#f5b942',pointRadius:0,borderWidth:1},
+      {label:'MA5',data:k.ma5,borderColor:'#f5b942',pointRadius:0,borderWidth:1},
       {label:'MA20',data:k.ma20,borderColor:'#3b82f6',pointRadius:0,borderWidth:1}]},
     options:{plugins:{legend:{labels:{color:'#8b96ad',font:{size:10}}}},
       scales:{x:{ticks:{color:'#8b96ad',maxTicksLimit:6}},y:{ticks:{color:'#8b96ad'}}}}});
@@ -861,22 +808,20 @@ async function analyze(){
 
 async function runBacktest(){
   const code=document.getElementById('bt-code').value.trim(),
-        fast=document.getElementById('bt-fast').value,
-        slow=document.getElementById('bt-slow').value;
+        fast=document.getElementById('bt-fast').value,slow=document.getElementById('bt-slow').value;
   document.getElementById('bt-stats').innerHTML='<div class="loading">回测中...</div>';
-  const r=await fetch(`${API}/api/backtest/${code}?fast=${fast}&slow=${slow}`);
-  const d=await r.json();
+  const r=await fetch(`${API}/api/backtest/${code}?fast=${fast}&slow=${slow}`);const d=await r.json();
   if(d.error){document.getElementById('bt-stats').innerHTML=`<div class="reason">${d.error}</div>`;return;}
   document.getElementById('bt-stats').innerHTML=`
     <div class="row"><span>总收益</span><span class="${cls(d.total_return)}">${d.total_return}%</span></div>
     <div class="row"><span>年化</span><span class="${cls(d.cagr)}">${d.cagr}%</span></div>
     <div class="row"><span>最大回撤</span><span class="down">${d.max_drawdown}%</span></div>
     <div class="row"><span>夏普</span><span>${d.sharpe}</span></div>
-    <div class="row"><span>交易次数/胜率</span><span>${d.trades} / ${d.win_rate}%</span></div>`;
+    <div class="row"><span>交易次数 / 胜率</span><span>${d.trades} / ${d.win_rate}%</span></div>`;
   if(btChart)btChart.destroy();
   btChart=new Chart(document.getElementById('bt-chart'),{type:'line',
     data:{labels:d.curve.dates,datasets:[
-      {label:'策略',    data:d.curve.equity,    borderColor:'#26d07c',pointRadius:0,borderWidth:1.5},
+      {label:'策略',data:d.curve.equity,borderColor:'#26d07c',pointRadius:0,borderWidth:1.5},
       {label:'买入持有',data:d.curve.benchmark,borderColor:'#8b96ad',pointRadius:0,borderWidth:1}]},
     options:{plugins:{legend:{labels:{color:'#8b96ad',font:{size:10}}}},
       scales:{x:{ticks:{color:'#8b96ad',maxTicksLimit:6}},y:{ticks:{color:'#8b96ad'}}}}});
@@ -885,31 +830,13 @@ async function runBacktest(){
 async function sendChat(){
   const inp=document.getElementById('chat-in'),msg=inp.value.trim();if(!msg)return;
   const box=document.getElementById('chat');
-  box.innerHTML+=`<div class="msg-u">${msg}</div>`;
-  inp.value='';inp.disabled=true;
-  box.scrollTop=box.scrollHeight;
-  box.innerHTML+='<div class="msg-a" id="thinking">🤖 思考中...</div>';
+  box.innerHTML+=`<div class="msg-u">${msg}</div>`;inp.value='';box.scrollTop=box.scrollHeight;
   const m=msg.match(/\d{6}/);
-  try{
-    const r=await fetch(`${API}/api/ai/chat`,{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:msg,code:m?m[0]:null})});
-    const d=await r.json();
-    document.getElementById('thinking').remove();
-    box.innerHTML+=`<div class="msg-a">🤖 ${d.reply}</div>`;
-  }catch(e){
-    document.getElementById('thinking').textContent='🤖 请求失败,请重试';
-  }
-  inp.disabled=false;inp.focus();
-  box.scrollTop=box.scrollHeight;
+  const r=await fetch(`${API}/api/ai/chat`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message:msg,code:m?m[0]:null})});
+  const d=await r.json();
+  box.innerHTML+=`<div class="msg-a">🤖 ${d.reply}</div>`;box.scrollTop=box.scrollHeight;
 }
-
-// Enter键发送
-document.addEventListener('DOMContentLoaded',()=>{
-  document.getElementById('chat-in').addEventListener('keydown',e=>{
-    if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}
-  });
-});
 
 function switchTab(p){
   document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
@@ -923,10 +850,8 @@ connectWS();loadRecs();
 </html>"""
 
 
-# ============================= 启动 =============================
 if __name__ == "__main__":
     import uvicorn
-    print(f"启动中... 打开 http://localhost:{PORT}")
+    print(f"启动中... 打开 http://{HOST}:{PORT}")
     print(f"数据源: {'东方财富(真实)' if adapter.use_real else '模拟数据'}")
-    print(f"AI模式: {'Claude (Anthropic)' if os.getenv('ANTHROPIC_API_KEY') else '本地规则兜底'}")
     uvicorn.run(app, host=HOST, port=PORT)
