@@ -3,4 +3,4 @@ uvicorn[standard]
 pandas
 numpy
 akshare
-https
+httpx
