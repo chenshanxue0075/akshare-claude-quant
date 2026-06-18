@@ -23,7 +23,7 @@ input{background:var(--card2);border:1px solid var(--line);color:var(--txt);bord
 </style>
 </head>
 <body>
-<div class="topbar"><strong>智选量化系统完全体</strong><span><span class="conn-dot" id="dot"></span> <span id="conn">连接中</span> | <span id="clock">--:--</span></span></div>
+<div class="topbar"><strong>高级量化系统完全体</strong><span><span class="conn-dot" id="dot"></span> <span id="conn">连接中</span> | <span id="clock">--:--</span></span></div>
 
 <div class="page active" id="page-rec">
   <div class="card"><strong>🌐 大盘环境透视</strong><div id="mkt-summary" style="font-size:12px;color:var(--sub);margin-top:6px;">公网真实行情对齐中...</div></div>
@@ -104,7 +104,7 @@ async function analyze(){
     const k=d.kline; if(!k||!k.dates.length) return;
     document.getElementById('an-chart').style.display='block';
     if(anChart) anChart.destroy();
-    anChart=new Chart(document.getElementById('an-chart'),{type:'line',data:{labels:k.dates,datasets:[{label:'收盘参考',data:k.close,borderColor:'#txt',pointRadius:0,borderWidth:1.5},{label:'MA5',data:k.ma5,borderColor:'#gold',pointRadius:0,borderWidth:1},{label:'MA20',data:k.ma20,borderColor:'#blue',pointRadius:0,borderWidth:1}]},options:{scales:{x:{ticks:{maxTicksLimit:6,color:'#6b8aaa'}},y:{ticks:{color:'#6b8aaa'}}}}});
+    anChart=new Chart(document.getElementById('an-chart'),{type:'line',data:{labels:k.dates,datasets:[{label:'收盘参考',data:k.close,borderColor:'#e2eef9',pointRadius:0,borderWidth:1.5},{label:'MA5',data:k.ma5,borderColor:'#f3b023',pointRadius:0,borderWidth:1},{label:'MA20',data:k.ma20,borderColor:'#3b82f6',pointRadius:0,borderWidth:1}]},options:{scales:{x:{ticks:{maxTicksLimit:6,color:'#718ca8'}},y:{ticks:{color:'#718ca8'}}}}});
   }
 }
 
@@ -116,7 +116,7 @@ async function runBacktest(){
   document.getElementById('bt-stats').innerHTML=`策略总回报: <span style="color:var(--green);font-weight:700;">${d.total_return}%</span> | 标的持有回报: ${d.bh_return}%<br>历史最大回撤: <span style="color:var(--red);">${d.max_drawdown}%</span> | 开平仓频率: ${d.trades}次<br><small style="color:var(--sub);">回测区间: ${d.period}</small>`;
   const cv=d.curve; document.getElementById('bt-chart').style.display='block';
   if(btChart) btChart.destroy();
-  btChart=new Chart(document.getElementById('bt-chart'),{type:'line',data:{labels:cv.dates,datasets:[{label:'策略收益',data:cv.equity,borderColor:'#green',pointRadius:0,borderWidth:1.5},{label:'基准持有',data:cv.benchmark,borderColor:'#sub',pointRadius:0,borderWidth:1,borderDash:[4,4]}]},options:{scales:{x:{ticks:{maxTicksLimit:6,color:'#6b8aaa'}},y:{ticks:{color:'#6b8aaa'}}}}});
+  btChart=new Chart(document.getElementById('bt-chart'),{type:'line',data:{labels:cv.dates,datasets:[{label:'策略收益',data:cv.equity,borderColor:'#00e699',pointRadius:0,borderWidth:1.5},{label:'基准持有',data:cv.benchmark,borderColor:'#718ca8',pointRadius:0,borderWidth:1,borderDash:[4,4]}]},options:{scales:{x:{ticks:{maxTicksLimit:6,color:'#718ca8'}},y:{ticks:{color:'#718ca8'}}}}});
 }
 
 async function sendChat(){
@@ -130,7 +130,6 @@ function switchTab(p){
   document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   document.getElementById('page-'+p).className='page active';
-  event.currentTarget.classList.add('active');
 }
 connectWS();
 </script>
