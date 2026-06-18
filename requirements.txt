@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 pandas
 numpy
-akshare
 httpx
+akshare
+jinja2
